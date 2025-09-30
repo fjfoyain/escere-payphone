@@ -115,11 +115,11 @@ app.post("/payphone/create", async (req, res) => {
     const clientTransactionId = `do${draftNumericId}_${Date.now()}`;
 
     // Redirige a la página con la Cajita Payphone (montos en centavos)
-    const redirectUrl =
-      `${FRONT_PAY_PAGE_URL}?tid=${encodeURIComponent(clientTransactionId)}` +
-      `&amount_cents=${amountCents}&amount_with_tax_cents=${amountCents}&tax_cents=0`;
+ const redirectUrl =
+  `${FRONT_PAY_PAGE_URL}?tid=${encodeURIComponent(clientTransactionId)}` +
+  `&amount_cents=${amountCents}&amount_with_tax_cents=0&tax_cents=0`;
 
-    return res.json({ redirectUrl });
+return res.json({ redirectUrl });
   } catch (e) {
     console.error("create error:", e);
     return res.status(500).json({ error: String(e.message || e), details: e.details || null });
