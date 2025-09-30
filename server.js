@@ -28,7 +28,7 @@ console.log("Using SHOPIFY_SHOP:", SHOPIFY_SHOP);
 
 // Helper GraphQL Shopify con logs
 const shopifyGraphql = async (query, variables = {}) => {
-  const url = `https://${SHOPIFY_SHOP}/admin/api/2024-10/graphql.json`; // versión estable
+  const url = `https://${SHOPIFY_SHOP}/admin/api/2024-10/graphql.json`;
   const resp = await fetch(url, {
     method: "POST",
     headers: {
@@ -37,14 +37,22 @@ const shopifyGraphql = async (query, variables = {}) => {
     },
     body: JSON.stringify({ query, variables })
   });
-  const json = await resp.json();
+
+  const text = await resp.text();
+  let json;
+  try { json = JSON.parse(text); } catch { json = null; }
+
   if (!resp.ok) {
-    console.error("Shopify HTTP error", resp.status, json);
-    throw new Error(`Shopify HTTP ${resp.status}`);
+    console.error("Shopify HTTP error", resp.status, text);
+    const err = new Error(`Shopify HTTP ${resp.status}`);
+    err.details = text;
+    throw err;
   }
-  if (json.errors) {
+  if (json?.errors) {
     console.error("Shopify GraphQL top-level errors:", JSON.stringify(json.errors, null, 2));
-    throw new Error("Shopify GraphQL error");
+    const err = new Error("Shopify GraphQL error");
+    err.details = json.errors;
+    throw err;
   }
   return json.data;
 };
