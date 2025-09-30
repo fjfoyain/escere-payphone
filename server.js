@@ -122,7 +122,7 @@ app.post("/payphone/create", async (req, res) => {
     return res.json({ redirectUrl });
   } catch (e) {
     console.error("create error:", e);
-    return res.status(500).json({ error: String(e.message || e) });
+    return res.status(500).json({ error: String(e.message || e), details: e.details || null });
   }
 });
 
