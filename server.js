@@ -5,22 +5,23 @@ import fetch from "node-fetch";
 const app = express();
 app.use(express.json());
 
-// ⚠️ Ajusta orígenes permitidos a tu dominio
+// Permite solo tu dominio público
 app.use(cors({ origin: ["https://escere.com", "https://www.escere.com"] }));
 
 // === ENV ===
 const {
-  PAYPHONE_TOKEN,          // token de app WEB Payphone
-  PAYPHONE_STORE_ID,       // storeId de Payphone (usado en la Cajita)
-  SHOPIFY_SHOP,            // ej: "escere.myshopify.com"
-  SHOPIFY_ADMIN_TOKEN,     // Admin API token
-  FRONT_PAY_PAGE_URL,      // ej: "https://escere.com/pages/pagar-payphone"
-  SUCCESS_URL              // ej: "https://escere.com/pages/gracias-pago"
+  PAYPHONE_TOKEN,          // Bearer Token (Payphone WEB app)
+  PAYPHONE_STORE_ID,       // storeId (Payphone) - se usa en la cajita (front)
+  SHOPIFY_SHOP,            // p.ej. escere-arte.myshopify.com (tu *.myshopify.com real)
+  SHOPIFY_ADMIN_TOKEN,     // Admin API token (Shopify)
+  FRONT_PAY_PAGE_URL,      // p.ej. https://escere.com/pages/pagar-payphone
+  SUCCESS_URL              // p.ej. https://escere.com/pages/gracias-pago
 } = process.env;
 
-// Helper Shopify GraphQL
+// --- helper Shopify GraphQL ---
 const shopifyGraphql = async (query, variables = {}) => {
-  const resp = await fetch(`https://${SHOPIFY_SHOP}/admin/api/2025-07/graphql.json`, {
+  const url = `https://${SHOPIFY_SHOP}/admin/api/2025-07/graphql.json`;
+  const resp = await fetch(url, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -29,32 +30,37 @@ const shopifyGraphql = async (query, variables = {}) => {
     body: JSON.stringify({ query, variables })
   });
   const json = await resp.json();
-  if (json.errors || json.data?.userErrors?.length) {
+  if (!resp.ok || json.errors) {
     console.error("Shopify GraphQL error:", JSON.stringify(json, null, 2));
     throw new Error("Shopify GraphQL error");
   }
   return json.data;
 };
 
-// 1) Iniciar pago: crea Draft Order y redirige a página con Cajita
+// ============= 1) CREATE: Crea DraftOrder a partir de variant_id/quantity =============
 app.post("/payphone/create", async (req, res) => {
   try {
-    const { items = [], email = "", currency = "USD", total_cents = 0 } = req.body;
-    if (!items.length || total_cents <= 0) {
-      return res.status(400).json({ error: "Carrito vacío o total inválido" });
+    const { items = [], email = "", currency = "USD" } = req.body;
+
+    // Esperamos items: [{ variant_id, quantity }]
+    if (!Array.isArray(items) || items.length === 0) {
+      return res.status(400).json({ error: "Carrito vacío" });
     }
 
-    // Mapea ítems a DraftOrder (precio en USD)
+    // Construimos los lineItems usando variantId (seguro: precio lo pone Shopify)
     const lineItems = items.map(i => ({
-      quantity: i.quantity,
-      originalUnitPrice: (i.price_cents / 100.0).toFixed(2),
-      title: i.title
+      quantity: Number(i.quantity || 0),
+      variantId: `gid://shopify/ProductVariant/${i.variant_id}`
     }));
 
     const createMutation = `
       mutation($input: DraftOrderInput!) {
         draftOrderCreate(input: $input) {
-          draftOrder { id name }
+          draftOrder {
+            id
+            name
+            subtotalPriceSet { presentmentMoney { amount currencyCode } }
+          }
           userErrors { field message }
         }
       }
@@ -65,28 +71,48 @@ app.post("/payphone/create", async (req, res) => {
       lineItems,
       tags: ["payphone"]
     };
+
     const dataCreate = await shopifyGraphql(createMutation, { input });
-    const draftId = dataCreate.draftOrderCreate.draftOrder.id; // gid://shopify/DraftOrder/<id>
-    const numericDraftId = draftId.split("/").pop();
+    const draft = dataCreate?.draftOrderCreate?.draftOrder;
+    if (!draft) throw new Error("No se pudo crear DraftOrder");
 
-    const clientTransactionId = `do${numericDraftId}_${Date.now()}`;
+    const draftGid = draft.id; // gid://shopify/DraftOrder/XXXXXXXX
+    const draftNumericId = draftGid.split("/").pop();
 
-    const redirectUrl = `${FRONT_PAY_PAGE_URL}?tid=${encodeURIComponent(clientTransactionId)}&amount_cents=${total_cents}&amount_with_tax_cents=${total_cents}&tax_cents=0`;
+    // Tomamos el subtotal del draft como monto a cobrar
+    const amountUsd = parseFloat(draft.subtotalPriceSet.presentmentMoney.amount || "0");
+    const amountCents = Math.round(amountUsd * 100);
+    if (!(amountCents > 0)) {
+      // Si llegara 0, evita continuar (producto $0 o error de precios)
+      return res.status(400).json({ error: "Total del pedido inválido (0)" });
+    }
+
+    // clientTransactionId único que referencia al draft
+    const clientTransactionId = `do${draftNumericId}_${Date.now()}`;
+
+    // Redirige a tu página con la cajita y montos en centavos
+    const redirectUrl =
+      `${FRONT_PAY_PAGE_URL}?tid=${encodeURIComponent(clientTransactionId)}` +
+      `&amount_cents=${amountCents}&amount_with_tax_cents=${amountCents}&tax_cents=0`;
+
     return res.json({ redirectUrl });
   } catch (e) {
-    console.error(e);
+    console.error("create error:", e);
     return res.status(500).json({ error: "No se pudo iniciar el pago" });
   }
 });
 
-// 2) Confirmación: Payphone → Confirm API → completar DraftOrder
+// ============= 2) CONFIRM: Confirma con Payphone y completa el DraftOrder =============
 app.get("/payphone/confirm", async (req, res) => {
   try {
     const id = parseInt(req.query.id || "0", 10);
     const clientTxId = req.query.clientTransactionId || "";
-    if (!id || !clientTxId) return res.status(400).send("Parámetros inválidos");
 
-    // Confirmación Payphone
+    if (!id || !clientTxId) {
+      return res.status(400).send("Parámetros inválidos");
+    }
+
+    // Confirmación obligatoria con Payphone (status final)
     const confResp = await fetch("https://pay.payphonetodoesposible.com/api/button/V2/Confirm", {
       method: "POST",
       headers: {
@@ -96,18 +122,23 @@ app.get("/payphone/confirm", async (req, res) => {
       body: JSON.stringify({ id, clientTxId })
     });
     const conf = await confResp.json();
-    const approved = conf?.statusCode === 3;
+    const approved = conf?.statusCode === 3; // 3 = Approved
+
     if (!approved) {
-      return res.redirect(`${SUCCESS_URL}?status=failed&tid=${encodeURIComponent(clientTxId)}&msg=${encodeURIComponent(conf?.message || "Pago cancelado")}`);
+      return res.redirect(
+        `${SUCCESS_URL}?status=failed&tid=${encodeURIComponent(clientTxId)}&msg=${encodeURIComponent(conf?.message || "Pago cancelado")}`
+      );
     }
 
-    // Extrae draftId de clientTxId: do<id>_<ts>
+    // Obtiene el id numérico del draft desde el TID: do<id>_<timestamp>
     const m = clientTxId.match(/^do(\d+)_/);
-    if (!m) return res.redirect(`${SUCCESS_URL}?status=error&reason=bad_tid`);
+    if (!m) {
+      return res.redirect(`${SUCCESS_URL}?status=error&reason=bad_tid`);
+    }
     const draftNumericId = m[1];
     const draftGid = `gid://shopify/DraftOrder/${draftNumericId}`;
 
-    // Completa DraftOrder -> Order
+    // Completar el draft → crea Order (pagada)
     const completeMutation = `
       mutation($id: ID!) {
         draftOrderComplete(id: $id) {
@@ -117,29 +148,30 @@ app.get("/payphone/confirm", async (req, res) => {
       }
     `;
     const completeData = await shopifyGraphql(completeMutation, { id: draftGid });
-    const order = completeData.draftOrderComplete?.draftOrder?.order;
-    const orderName = order?.name || "";
+    const order = completeData?.draftOrderComplete?.draftOrder?.order;
 
-    return res.redirect(`${SUCCESS_URL}?status=success&order=${encodeURIComponent(orderName)}&tid=${encodeURIComponent(clientTxId)}&auth=${encodeURIComponent(conf?.authorizationCode || "")}`);
+    return res.redirect(
+      `${SUCCESS_URL}?status=success&order=${encodeURIComponent(order?.name || "")}&tid=${encodeURIComponent(clientTxId)}&auth=${encodeURIComponent(conf?.authorizationCode || "")}`
+    );
   } catch (e) {
-    console.error("Error confirm:", e);
+    console.error("confirm error:", e);
     return res.redirect(`${SUCCESS_URL}?status=error`);
   }
 });
 
-// (Opcional) 3) Webhook/Notificación Externa de Payphone
+// (opcional) Webhook/Notificación Externa de Payphone
 app.post("/payphone/notify", async (req, res) => {
   try {
-    // Valida firma si Payphone envía headers de verificación.
-    // Guarda/actualiza estado del pago en tu DB si lo necesitas.
     console.log("Webhook Payphone:", req.body);
     res.sendStatus(200);
   } catch (e) {
-    console.error("notify", e);
+    console.error("notify error:", e);
     res.sendStatus(500);
   }
 });
 
+// Healthcheck
 app.get("/", (_req, res) => res.send("OK"));
+
 const port = process.env.PORT || 3000;
 app.listen(port, () => console.log("Server on", port));
